@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novaproxy-cli"
+version = "1.0.0"
+description = "Official terminal client for the NovaProxy API gateway"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "requests>=2.28",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0; python_version >= '3.8'",
+]
+
+[project.optional-dependencies]
+windows = ["pyreadline3"]
+
+[project.scripts]
+novaproxy = "novaproxy.app:main"
+
+[tool.setuptools.packages.find]
+include = ["novaproxy*"]
