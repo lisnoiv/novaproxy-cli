@@ -1,27 +1,23 @@
 # NovaProxy CLI
 
-Кроссплатформенный терминальный клиент для API-шлюза **NovaProxy** с интерфейсом
-в стиле OpenCode: центрированный баннер, сообщения с цветной границей,
-статус-бар с чипами, overlay-диалоги, permission-система для инструментов.
+Кроссплатформенный терминальный AI-клиент для **NovaProxy** с интерфейсом в стиле OpenCode: потоковые ответы, вызов инструментов (файлы, shell, поиск), MCP-серверы, сессии, темы и слэш-команды с автоподсказкой.
 
-*A cross-platform terminal client for the **NovaProxy** API gateway with an
-OpenCode-style TUI: centered banner, bordered messages, status bar chips,
-overlay dialogs and a permission system for tool calls.*
+Написан на **Go** (bubbletea + lipgloss + glamour), собирается в один бинарник без внешних зависимостей. Работает на **Android (Termux)**, **Windows**, **Linux** и **macOS**.
 
 ---
 
-## Установка (одна команда)
+## 1. Установка в 1 команду
 
 ### Android (Termux)
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.sh | sh
 ```
 
 ### Linux / macOS
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.sh | sh
 ```
 
 ### Windows (PowerShell)
@@ -30,162 +26,150 @@ curl -sSL https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.s
 irm https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.ps1 | iex
 ```
 
-Установщик сам найдёт или поставит Python 3.8+ и git, скачает клиент и
-добавит команду `novaproxy` в PATH.
+Установщик сам поставит `git` и Go (через `pkg`/`apt`/`dnf`/`pacman`/`brew`/`winget`), склонирует репозиторий, соберёт бинарник из **вендоренных** зависимостей (ничего не скачивается из сети при сборке) и положит его в `~/.local/bin` (Linux/macOS/Termux) или `%USERPROFILE%\bin` (Windows).
+
+> Если после установки пишет `command not found` — перезапусти терминал (PATH обновился).
 
 ---
 
-## Первый запуск
+## 2. Первый запуск и активация
 
 ```sh
 novaproxy
 ```
 
-При первом запуске появится приглашение:
+При первом запуске CLI попросит ключ:
 
 ```
 Введите ваш API-ключ (формат px_live_...):
 ```
 
-Вставьте ключ `px_live_...` — клиент проверит его на сервере и сохранит в
-`~/.novaproxy/config.json` (права 0600). При следующих запусках ключ
-подтягивается автоматически и перепроверяется на сервере: если он отозван
-или истёк, клиент попросит ввести новый.
+Вставь ключ вида `px_live_...` и нажми Enter. CLI проверит его на сервере NovaProxy и сохранит в `~/.novaproxy/config.json` (права `0600`). При следующих запусках ключ подхватывается автоматически.
 
-Смена ключа: `/key` в чате, или `novaproxy --auth`, или
-`novaproxy --key px_live_...`.
+Сменить ключ:
+
+```sh
+novaproxy --auth
+# или прямо в чате:
+/key px_live_новый_ключ
+```
 
 ---
 
-## Использование
+## 3. Использование
 
-### Интерактивный режим
+### Интерактивный режим (HUD)
 
-```sh
-novaproxy
-```
+Просто запусти `novaproxy` без аргументов. Печатай сообщения, Enter — отправить.
 
-Пишите запросы в строку ` > `. Внизу — статус-бар: подсказка, счётчик
-токенов, имя сессии и текущая модель.
-
-### Одиночный запрос
-
-```sh
-novaproxy "объясни этот код" < main.py
-cat error.log | novaproxy "найди причину ошибки"
-novaproxy -m gpt-6-astra --reasoning high "реши задачу"
-```
-
-Ответ стримится в stdout, служебная строка — в stderr.
-
-### Файлы в контексте через @
-
-```
-> найди баг в @src/main.py
-> что в этой папке? @src/
-```
-
-### Инструменты (function calling)
-
-Модели с поддержкой function calling получают локальные инструменты:
-`read_file`, `write_file`, `edit_file`, `bash`, `search`, `web_search`
-плюс инструменты подключённых MCP-серверов.
-
-Опасные действия (`bash`, запись файлов) спрашивают разрешения:
-`Allow (a)` / `Allow for session (s)` / `Deny (d)`. Политика настраивается
-через `/permissions`. Управление инструментами: `/tools list`,
-`/tools disable bash`, `/tools enable bash`, `/tools` — вкл/выкл всех.
-
-### MCP-серверы
-
-```
-/mcp add fs npx -y @modelcontextprotocol/server-filesystem /sdcard
-/mcp          # статус
-/mcp tools    # инструменты
-/mcp del fs   # удалить
-```
-
-Или в конфиге `~/.novaproxy/config.json`:
-
-```json
-{
-  "mcp_servers": {
-    "fs": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/sdcard"] },
-    "remote": { "url": "http://localhost:3000/mcp" }
-  }
-}
-```
+- `@file` / `@dir/` — прикрепить файл или каталог к запросу (`покажи баги в @main.go`).
+- `!команда` — выполнить shell-команду и показать вывод (`!ls -la`).
+- `/` в начале строки — всплывающие подсказки команд; `Tab` — автодополнение, `↑`/`↓` — выбор.
+- `Esc` / `Ctrl+C` — прервать генерацию.
+- `Alt+Enter` или `\` в конце строки — многострочный ввод.
 
 ### Слэш-команды
 
-| Команда | Действие |
+| Команда | Описание |
 |---|---|
-| `/help` | справка |
-| `/init` | анализ проекта и создание/обновление `NOVA.md` |
-| `/compact` | сжать сессию в сводку |
-| `/new` | новая сессия (текущая сохраняется) |
-| `/clear`, `/reset` | сброс контекста |
-| `/model` | диалог выбора модели / `/model <id>` |
-| `/models` | список моделей |
-| `/mode` | code / chat / reasoning |
-| `/system` | системный промпт (`/system reset` — сброс) |
-| `/mcp` | MCP-серверы |
-| `/tools` | управление инструментами |
-| `/permissions` | разрешения bash/write |
-| `/key` | сменить API-ключ |
-| `/balance` | баланс ключа |
-| `/cost` | токены сессии |
-| `/status` | информация о сессии |
-| `/history` | все запросы |
-| `/sessions` | сохранённые сессии |
-| `/resume` | вернуться в сессию |
-| `/theme` | выбор цветовой темы |
-| `/copy` | последний ответ в буфер |
-| `/copycode` | последний блок кода в буфер |
-| `/diff` | `git diff --stat` |
-| `/doctor` | диагностика |
-| `/export [файл]` | экспорт чата в Markdown |
-| `!cmd` | shell-команда |
-| `esc` | отменить генерацию |
-| `/exit`, `/quit` | выход |
+| `/help` | список всех команд |
+| `/models` | список моделей прокси |
+| `/model` | сменить модель на лету |
+| `/mode` | режим `code` / `chat` / `reasoning` |
+| `/system` | просмотр/смена системного промпта |
+| `/new`, `/clear` | новая сессия / сброс контекста |
+| `/history` | все запросы сессии |
+| `/sessions`, `/resume` | сохранённые сессии, возврат |
+| `/init` | создать/обновить `NOVA.md` (память проекта) |
+| `/compact` | сжать историю в сводку |
+| `/mcp` | статус MCP-серверов |
+| `/tools`, `/permissions` | инструменты и разрешения |
+| `/key`, `/auth` | сменить API-ключ |
+| `/balance`, `/cost`, `/status` | баланс, токены сессии, инфо |
+| `/theme` | сменить цветовую тему |
+| `/copy`, `/copycode` | ответ / блок кода в буфер обмена |
+| `/diff` | `git diff --stat` текущего репозитория |
+| `/export` | экспорт чата в markdown |
+| `/doctor` | диагностика окружения |
+| `/exit` | выход |
 
-### Флаги
+### One-shot режим (один запрос без REPL)
 
+```sh
+novaproxy "напиши hello world на python"
+cat error.log | novaproxy "объясни ошибку"
+novaproxy --model kimi-k3 "сравни два подхода"
 ```
-novaproxy --model gpt-6-astra     # модель на этот запуск
-novaproxy --mode chat             # code/chat/reasoning
-novaproxy --system "..."          # свой системный промпт
-novaproxy --reasoning high        # reasoning_effort для gpt-6-astra
-novaproxy --key px_live_...       # сохранить ключ и выйти
-novaproxy --auth                  # сменить ключ
-novaproxy --quiet                 # one-shot без мета-строки
+
+Флаги: `--model`, `--mode code|chat|reasoning`, `--system "..."`, `--reasoning low|medium|high|xhigh|max`, `--quiet`.
+
+### Свои команды (скиллы)
+
+Положи markdown-файл в `~/.novaproxy/commands/`:
+
+```sh
+mkdir -p ~/.novaproxy/commands
+echo 'Сделай код-ревизию и укажи на баги.' > ~/.novaproxy/commands/review.md
 ```
+
+Теперь в чате работает `/review @src/main.go`.
+
+### MCP-серверы
+
+Подключение внешних инструментов через Model Context Protocol. В `~/.novaproxy/config.json`:
+
+```json
+"mcp_servers": {
+  "filesystem": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/sdcard"] },
+  "myapi":      { "type": "http",  "url": "http://127.0.0.1:9000/mcp" }
+}
+```
+
+Инструменты MCP появляются как `mcp__<сервер>__<инструмент>` и доступны модели при function calling. Статус — команда `/mcp`.
+
+### Разрешения на инструменты
+
+По умолчанию: чтение файлов — авто, запись и shell — спрашивает. Настройка в конфиге:
+
+```json
+"permissions": { "read": "allow", "write": "ask", "bash": "ask" }
+```
+
+или командой `/permissions` в чате. `allow` / `ask` / `deny`.
 
 ---
 
-## Troubleshooting
+## 4. Решение частых проблем
 
-**`novaproxy: command not found`** — перезапустите терминал или
-`export PATH="$HOME/.local/bin:$PATH"` (на Windows закройте и откройте
-PowerShell).
+**`command not found: novaproxy`** — перезапусти терминал или выполни `export PATH="$HOME/.local/bin:$PATH"` (Windows: закрой и открой PowerShell заново).
 
-**Python не найден (Windows)** — установщик использует winget; иначе
-поставьте Python 3.8+ с python.org («Add Python to PATH»).
+**`go: command not found` при установке** — установщик не смог поставить Go автоматически. Поставь вручную: Termux `pkg install golang`, Windows — https://go.dev/dl/, затем запусти установщик ещё раз.
 
-**Ключ отклоняется** — должен начинаться с `px_live_`. Проверка: `/doctor`.
+**Ключ не принимается** — проверь, что ключ начинается с `px_live_` и не истёк. Проверка вручную: `novaproxy --key px_live_...`.
 
-**Крякозябры в Windows** — `chcp 65001` или Windows Terminal с
-Unicode-шрифтом (Cascadia Mono).
+**Кривые символы/рамки в Windows** — используй Windows Terminal (не старый `conhost`), шрифт с поддержкой Unicode (Cascadia Mono, JetBrains Mono).
 
-**Буфер обмена** — Termux: `pkg install termux-api` + приложение Termux:API;
-Linux: `xclip` или `wl-clipboard`; Windows/macOS — из коробки.
+**Русский текст отображается `???` в Windows PowerShell** — выполни `[Console]::OutputEncoding = [Text.Encoding]::UTF8` или добавь `$OutputEncoding = [Text.Encoding]::UTF8` в профиль PowerShell.
 
-## Безопасность
+**Ошибка сети / таймаут** — проверь, что `https://novaproxy.duckdns.org` доступен из твоей сети (некоторые сети блокируют duckdns).
 
-Ключ хранится локально с правами 0600 и отправляется только на сервер
-NovaProxy (`novaproxy.duckdns.org`). Телеметрии и сторонних запросов нет,
-код полностью открыт.
+**Где лежит конфиг?** — `~/.novaproxy/config.json` (Windows: `%USERPROFILE%\.novaproxy\config.json`). Удаление файла = полный сброс.
 
-## License
+---
+
+## 5. Сборка из исходников вручную
+
+```sh
+git clone https://github.com/lisnoiv/novaproxy-cli.git
+cd novaproxy-cli
+go build -mod=vendor -o novaproxy .
+./novaproxy
+```
+
+Все зависимости лежат в `vendor/` — сборка полностью офлайн, нужен только Go 1.21+.
+
+---
+
+## Лицензия
 
 MIT

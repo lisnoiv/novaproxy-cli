@@ -1,5 +1,11 @@
-*.egg-info/
-__pycache__/
-*.pyc
-/dist/
-/build/
+novaproxy
+novaproxy.exe
+*.log
+tui_out.txt
+tui_comp.txt
+tui_full.txt
+rd_out.txt
+dbg.log
+dbg2.log
+pty_*.py
+mock.py

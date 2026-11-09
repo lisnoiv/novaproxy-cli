@@ -1,105 +1,103 @@
 #!/bin/sh
-# NovaProxy CLI — one-line installer for Linux / macOS / Termux.
-#   curl -sSL https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.sh | sh
+# NovaProxy CLI — one-line installer (Termux / Linux / macOS)
 set -e
 
 REPO="https://github.com/lisnoiv/novaproxy-cli.git"
-DEST="$HOME/.novaproxy/app"
-BIN="$HOME/.local/bin"
+DIR="$HOME/novaproxy-cli"
+BIN_NAME="novaproxy"
 
-say() { printf '\033[38;5;141m[novaproxy]\033[0m %s\n' "$1"; }
-err() { printf '\033[38;5;203m[novaproxy] %s\033[0m\n' "$1" >&2; }
+say() { printf '%s\n' "$*"; }
 
-# --- python ---------------------------------------------------------------
-PY=""
-for cand in python3 python; do
-    if command -v "$cand" >/dev/null 2>&1; then
-        if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
-            PY="$cand"; break
-        fi
-    fi
-done
+have() { command -v "$1" >/dev/null 2>&1; }
 
-if [ -z "$PY" ]; then
-    say "Python не найден — пытаюсь установить..."
-    if [ -n "$PREFIX" ] && echo "$PREFIX" | grep -q "com.termux"; then
-        pkg install -y python
-        PY=python3
-    elif command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip
-        PY=python3
-    elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y python3 python3-pip
-        PY=python3
-    elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -Sy --noconfirm python python-pip
-        PY=python3
-    elif command -v brew >/dev/null 2>&1; then
-        brew install python@3
-        PY=python3
+install_go() {
+    if have go; then return 0; fi
+    say "==> Go toolchain not found, installing..."
+    if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; then
+        pkg install -y golang
+    elif have apt-get; then
+        sudo apt-get update -y && sudo apt-get install -y golang-go || sudo apt-get install -y golang
+    elif have dnf; then
+        sudo dnf install -y golang
+    elif have pacman; then
+        sudo pacman -Sy --noconfirm go
+    elif have brew; then
+        brew install go
+    elif have apk; then
+        sudo apk add --no-cache go
     else
-        err "Установите Python 3.8+ вручную и перезапустите установку."
+        say "ERROR: could not auto-install Go. Install Go 1.21+ from https://go.dev/dl/ and re-run."
         exit 1
     fi
-fi
-say "Python: $($PY --version 2>&1)"
+}
 
-# --- git ------------------------------------------------------------------
-if ! command -v git >/dev/null 2>&1; then
-    say "git не найден — пытаюсь установить..."
-    if [ -n "$PREFIX" ] && echo "$PREFIX" | grep -q "com.termux"; then
+install_git() {
+    if have git; then return 0; fi
+    say "==> git not found, installing..."
+    if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; then
         pkg install -y git
-    elif command -v apt-get >/dev/null 2>&1; then
+    elif have apt-get; then
         sudo apt-get install -y git
-    elif command -v dnf >/dev/null 2>&1; then
+    elif have dnf; then
         sudo dnf install -y git
-    elif command -v pacman >/dev/null 2>&1; then
+    elif have pacman; then
         sudo pacman -Sy --noconfirm git
-    elif command -v brew >/dev/null 2>&1; then
+    elif have brew; then
         brew install git
+    elif have apk; then
+        sudo apk add --no-cache git
     else
-        err "Установите git вручную и перезапустите установку."
+        say "ERROR: could not auto-install git."
         exit 1
     fi
-fi
+}
 
-# --- sources ----------------------------------------------------------------
-mkdir -p "$HOME/.novaproxy"
-if [ -d "$DEST/.git" ]; then
-    say "Обновляю существующую установку..."
-    git -C "$DEST" pull --ff-only -q || { rm -rf "$DEST"; git clone -q "$REPO" "$DEST"; }
+say "==> NovaProxy CLI installer"
+install_git
+install_go
+
+if [ -d "$DIR/.git" ]; then
+    say "==> Updating existing checkout in $DIR"
+    git -C "$DIR" pull --ff-only || git -C "$DIR" pull --rebase
 else
-    rm -rf "$DEST"
-    say "Скачиваю NovaProxy CLI..."
-    git clone -q "$REPO" "$DEST"
+    say "==> Cloning $REPO"
+    git clone --depth 1 "$REPO" "$DIR"
 fi
 
-# --- python deps ------------------------------------------------------------
-say "Устанавливаю зависимости..."
-"$PY" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-"$PY" -m pip install --quiet --user -e "$DEST" || "$PY" -m pip install --quiet --user requests rich
+cd "$DIR"
+say "==> Building (vendored deps, no downloads)..."
+GOFLAGS=-mod=vendor go build -trimpath -ldflags "-s -w" -o "$BIN_NAME" .
 
-# --- launcher ---------------------------------------------------------------
-mkdir -p "$BIN"
-cat > "$BIN/novaproxy" <<EOF
-#!/bin/sh
-exec $PY -m novaproxy "\$@"
-EOF
-chmod +x "$BIN/novaproxy"
+BINDIR="$HOME/.local/bin"
+mkdir -p "$BINDIR"
+cp "$BIN_NAME" "$BINDIR/$BIN_NAME"
+chmod +x "$BINDIR/$BIN_NAME"
 
+# ensure ~/.local/bin on PATH
 case ":$PATH:" in
-    *":$BIN:"*) ;;
+    *":$BINDIR:"*) ;;
     *)
-        say "Добавляю $BIN в PATH..."
-        for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
-            if [ -f "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
-                grep -q 'novaproxy' "$rc" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH" # novaproxy' >> "$rc"
-            fi
-        done
-        export PATH="$BIN:$PATH"
+        PROFILE=""
+        if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; then
+            PROFILE="$HOME/.bashrc"
+        elif [ -f "$HOME/.zshrc" ]; then
+            PROFILE="$HOME/.zshrc"
+        elif [ -f "$HOME/.bashrc" ]; then
+            PROFILE="$HOME/.bashrc"
+        elif [ -f "$HOME/.profile" ]; then
+            PROFILE="$HOME/.profile"
+        fi
+        if [ -n "$PROFILE" ]; then
+            echo "export PATH=\"$BINDIR:\$PATH\"" >> "$PROFILE"
+            say "==> Added $BINDIR to PATH in $PROFILE (restart shell or: export PATH=\"$BINDIR:\$PATH\")"
+        fi
+        export PATH="$BINDIR:$PATH"
         ;;
 esac
 
-say "Готово! Запустите:  novaproxy"
-say "При первом запуске введите ключ формата px_live_..."
-exec "$BIN/novaproxy" --version >/dev/null 2>&1 && exit 0 || exit 0
+say ""
+say "==> Installed: $BINDIR/$BIN_NAME"
+"$BINDIR/$BIN_NAME" --version || true
+say ""
+say "Запусти:  novaproxy"
+say "При первом запуске введи свой ключ вида px_live_..."
