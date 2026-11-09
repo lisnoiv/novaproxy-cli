@@ -12,7 +12,7 @@ import os
 import stat
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 CONFIG_DIR = Path(os.environ.get("NOVAPROXY_HOME", Path.home() / ".novaproxy"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -25,8 +25,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "system_prompt": None,
     "mode": "code",
     "mcp_servers": {},
-    "theme": 141,
-    "sidebar": True,
+    "theme": "opencode",
+    "autocompact": True,
+    "permissions": {"bash": "ask", "write": "ask"},
+    "disabled_tools": [],
 }
 
 
@@ -39,7 +41,7 @@ class ConfigStore:
 
     def __init__(self, path: Path = CONFIG_PATH) -> None:
         self.path = path
-        self.data: Dict[str, Any] = dict(DEFAULT_CONFIG)
+        self.data: Dict[str, Any] = json.loads(json.dumps(DEFAULT_CONFIG))
         self.load()
 
     def load(self) -> None:
@@ -47,12 +49,14 @@ class ConfigStore:
             if self.path.exists():
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
-                    merged = dict(DEFAULT_CONFIG)
-                    merged.update({k: v for k, v in raw.items() if k in DEFAULT_CONFIG or k == "mcp_servers"})
-                    self.data = merged
+                    for k, v in raw.items():
+                        if k in self.data or k == "mcp_servers":
+                            if isinstance(self.data.get(k), dict) and isinstance(v, dict):
+                                self.data[k].update(v)
+                            else:
+                                self.data[k] = v
         except (OSError, json.JSONDecodeError):
-            # Corrupt config must never crash the client; start from defaults.
-            self.data = dict(DEFAULT_CONFIG)
+            self.data = json.loads(json.dumps(DEFAULT_CONFIG))
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,10 +65,9 @@ class ConfigStore:
         try:
             os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
-            pass  # Windows has no POSIX modes; ignore.
+            pass  # Windows has no POSIX modes
         os.replace(tmp, self.path)
 
-    # -- convenience accessors ------------------------------------------------
     @property
     def api_key(self) -> Optional[str]:
         return self.data.get("api_key")
@@ -106,9 +109,27 @@ class ConfigStore:
     def mcp_servers(self, value: Dict[str, Any]) -> None:
         self.data["mcp_servers"] = value
 
+    @property
+    def permissions(self) -> Dict[str, str]:
+        p = self.data.get("permissions")
+        return p if isinstance(p, dict) else {"bash": "ask", "write": "ask"}
+
+    @permissions.setter
+    def permissions(self, value: Dict[str, str]) -> None:
+        self.data["permissions"] = value
+
+    @property
+    def disabled_tools(self) -> list:
+        d = self.data.get("disabled_tools")
+        return d if isinstance(d, list) else []
+
+    @disabled_tools.setter
+    def disabled_tools(self, value: list) -> None:
+        self.data["disabled_tools"] = value
+
 
 def prompt_for_key(validate_fn, out=sys.stdout, inp=input) -> str:
-    """Interactive first-run key prompt with local + remote validation."""
+    """Interactive key prompt with local + remote validation."""
     while True:
         try:
             key = inp("  Введите ваш API-ключ (формат px_live_...): ").strip()
@@ -118,11 +139,11 @@ def prompt_for_key(validate_fn, out=sys.stdout, inp=input) -> str:
         if not key:
             continue
         if not key_format_ok(key):
-            out.write("  \x1b[38;5;203mКлюч должен начинаться с px_live_ — проверьте и повторите.\x1b[0m\n")
+            out.write("  \x1b[38;2;224;108;117mКлюч должен начинаться с px_live_ — проверьте и повторите.\x1b[0m\n")
             continue
         out.write("  Проверяю ключ на сервере NovaProxy...\n")
         ok, err = validate_fn(key)
         if ok:
-            out.write("  \x1b[38;5;114mКлюч принят и сохранён в ~/.novaproxy/config.json\x1b[0m\n")
+            out.write("  \x1b[38;2;127;216;143mКлюч принят и сохранён в ~/.novaproxy/config.json\x1b[0m\n")
             return key
-        out.write(f"  \x1b[38;5;203mСервер отклонил ключ: {err}\x1b[0m\n")
+        out.write(f"  \x1b[38;2;224;108;117mСервер отклонил ключ: {err}\x1b[0m\n")

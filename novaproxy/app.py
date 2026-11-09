@@ -1,40 +1,40 @@
-"""NovaProxy CLI application: REPL + one-shot modes."""
+"""NovaProxy CLI application: OpenCode-style REPL + one-shot modes."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from . import __version__
 from .api import ApiError, NovaClient, StreamAccumulator
 from .config import ConfigStore, key_format_ok, prompt_for_key
-from .hud import B, D, R, Hud, art, boot, c, copy_to_clipboard, write
+from .hud import (
+    B, I, R, THEMES, THEMES as _T, CancelListener, MUTED, PRIMARY, SECONDARY,
+    Tui, copy_to_clipboard, fg, write, ERR,
+)
 from .mcp import McpManager
 from .prompts import PROMPTS, normalize_mode, system_prompt_for
-from .render import render_to_string
-from .tools import (
-    BUILTIN_TOOLS,
-    dispatch_builtin,
-    expand_at_references,
-    git_diff_stat,
-)
+from .tools import BUILTIN_TOOLS, dispatch_builtin, expand_at_references, git_diff_stat
 
 HELP = [
     ("/help", "список команд"),
+    ("/init", "создать/обновить NOVA.md (анализ кодовой базы)"),
+    ("/compact", "сжать сессию в сводку"),
     ("/new", "новая сессия"),
-    ("/clear", "очистить чат"),
-    ("/reset", "сброс контекста"),
-    ("/compact", "сжать контекст"),
+    ("/clear", "сброс контекста"),
     ("/model", "сменить модель"),
     ("/models", "список моделей"),
     ("/mode", "режим: code/chat/reasoning"),
     ("/system", "системный промпт"),
     ("/mcp", "MCP-серверы"),
     ("/tools", "инструменты вкл/выкл"),
+    ("/permissions", "разрешения инструментов"),
     ("/key", "сменить API-ключ"),
     ("/balance", "баланс ключа"),
     ("/cost", "токены сессии"),
@@ -42,12 +42,10 @@ HELP = [
     ("/history", "все запросы"),
     ("/sessions", "сохранённые сессии"),
     ("/resume", "вернуться в сессию"),
-    ("/sidebar", "панель вкл/выкл"),
-    ("/theme", "сменить цвет"),
+    ("/theme", "сменить тему"),
     ("/copy", "ответ в буфер"),
     ("/copycode", "последний блок кода в буфер"),
     ("/diff", "git diff --stat"),
-    ("/init", "создать NOVA.md"),
     ("/doctor", "проверка окружения"),
     ("/export", "чат в файл"),
     ("/exit", "выход"),
@@ -56,10 +54,11 @@ EXTRA = [
     ("!cmd", "выполнить команду в shell"),
     ("@file", "прикрепить файл к запросу"),
     ("Tab / ↑↓", "автодополнение / история ввода"),
-    ("/ или Enter", "меню команд"),
+    ("esc", "отменить генерацию"),
 ]
 CMDS = [h[0] for h in HELP] + ["/quit"]
-THEMES = [141, 114, 203, 39, 221, 208]
+
+CONTEXT_LIMIT = 128_000
 
 
 class App:
@@ -78,17 +77,15 @@ class App:
             "reqs": 0,
             "tin": 0,
             "tout": 0,
-            "calls": [],
             "hist": [],
             "chat": [],
-            "side": bool(cfg.data.get("sidebar", True)),
             "t0": time.time(),
             "saved": {},
-            "ttft": None,
-            "tps": None,
         }
-        self.acc = int(cfg.data.get("theme", 141))
-        self.hud = Hud(self.S, accent=self.acc)
+        theme_map = dict(THEMES)
+        theme_name = cfg.data.get("theme", "opencode")
+        self.theme = theme_name if theme_name in theme_map else "opencode"
+        self.tui = Tui(primary=theme_map[self.theme])
         self._reset_messages()
 
     # ------------------------------------------------------------- messages
@@ -99,7 +96,36 @@ class App:
     def _all_tools(self) -> List[Dict[str, Any]]:
         if not self.tools_enabled:
             return []
-        return BUILTIN_TOOLS + self.mcp.openai_tools()
+        disabled = set(self.cfg.disabled_tools)
+        tools = [t for t in BUILTIN_TOOLS if t["function"]["name"] not in disabled]
+        return tools + self.mcp.openai_tools()
+
+    def _tool_risk(self, name: str, args: Dict[str, Any]) -> str:
+        if name in ("write_file", "edit_file"):
+            return "write"
+        if name == "bash":
+            return "bash"
+        return "read"
+
+    def _check_permission(self, name: str, arguments: str) -> bool:
+        risk = self._tool_risk(name, json.loads(arguments or "{}"))
+        mode = self.cfg.permissions.get(risk, "ask")
+        if mode == "allow":
+            return True
+        if mode == "deny":
+            return False
+        if getattr(self, "_session_allow_" + risk, False):
+            return True
+        detail = arguments[:120].replace("\n", " ")
+        idx = self.tui.confirm(
+            "Permission Required",
+            f"Tool: {name}\n{risk}: {detail}",
+            ["Allow (a)", "Allow for session (s)", "Deny (d)"],
+        )
+        if idx == 1:
+            setattr(self, "_session_allow_" + risk, True)
+            return True
+        return idx == 0
 
     def _run_tool_call(self, name: str, arguments: str) -> str:
         if name.startswith("mcp__"):
@@ -108,97 +134,107 @@ class App:
 
     # ------------------------------------------------------------ streaming
     def ask(self, prompt: str, on_status=None, on_token=None) -> str:
-        """Send the prompt, handle tool calls, stream the reply. Returns text."""
+        interactive = on_token is None
         expanded, attached = expand_at_references(prompt)
-        if on_token is None:
-            for path, lines in attached:
-                self.hud.call("read_file", path, 5)
-                self.hud.say(f"{lines} строк прикреплено ({path})")
+        for path, lines in attached:
+            if interactive:
+                self.tui.print_tool_header("read_file", path)
+                self.tui.print_tool_result("%d строк прикреплено" % lines)
 
         self.S["reqs"] += 1
         self.S["tin"] += max(1, int(len(expanded.split()) * 1.4))
         self.S["hist"].append((time.strftime("%H:%M"), prompt))
         if self.S["name"] == "untitled":
             self.S["name"] = prompt[:20]
-        if on_token is None:
-            self.S["chat"].append(("user", prompt))
         self.messages.append({"role": "user", "content": expanded})
 
+        if interactive:
+            write("\n")
+            self.tui.print_user_message(prompt)
+
         final_text = ""
-        for _round in range(8):  # tool-call loop guard
+        t0 = time.monotonic()
+        for _round in range(8):
             acc = StreamAccumulator()
-            spin = 0
             tools = self._all_tools()
-            effort = self.args.reasoning if getattr(self.args, "reasoning", None) else None
+            effort = getattr(self.args, "reasoning", None)
+            listener = CancelListener() if interactive else None
+            if listener:
+                listener.start()
+            canceled = False
+            frame = 0
             try:
                 stream = self.client.chat_stream(
                     self.messages, self.S["model"], tools=tools or None, reasoning_effort=effort
                 )
                 for event in stream:
+                    if listener and listener.pressed:
+                        canceled = True
+                        break
                     piece = acc.feed(event)
                     if piece:
-                        final_text += piece if acc.tool_calls == {} else ""
                         if on_token:
                             on_token(piece)
                         else:
-                            # update last chat line live
-                            if self.S["chat"] and self.S["chat"][-1][0] == "ai" and self.S["chat"][-1][1].endswith("…"):
-                                pass
-                            if not self.S["chat"] or self.S["chat"][-1][0] != "ai":
-                                self.S["chat"].append(("ai", ""))
-                            cur = self.S["chat"][-1][1]
-                            self.S["chat"][-1] = ("ai", cur + piece)
-                            self.S["tout"] += 1
-                            self.hud.frame("stream")
-                    elif on_token is None:
-                        if on_status:
-                            on_status(self.hud.spinner(spin, "thinking"))
-                        else:
-                            self.hud.frame(self.hud.spinner(spin, "thinking"))
-                        spin += 1
+                            write(piece)
+                    elif interactive and not piece:
+                        pass
+                    frame += 1
             except ApiError as exc:
                 err_line = "ошибка API: " + str(exc)
-                if on_token is not None:
-                    sys.stderr.write(err_line + "\n")
+                if interactive:
+                    write("\n")
+                    self.tui.print_tool_result(err_line, is_error=True)
+                    write("\n")
                 else:
-                    self.hud.say(err_line)
-                self.messages.pop()  # drop the unanswered user message
+                    sys.stderr.write(err_line + "\n")
+                self.messages.pop()
                 return ""
+            finally:
+                if listener:
+                    listener.stop()
+                if interactive:
+                    self.tui.clear_working()
 
+            took = time.monotonic() - t0
             msg = acc.assistant_message()
             self.messages.append(msg)
             if acc.usage:
                 self.S["tin"] = self.S["tin"] - max(1, int(len(expanded.split()) * 1.4)) + int(acc.usage.get("prompt_tokens", 0))
                 self.S["tout"] = int(acc.usage.get("completion_tokens", self.S["tout"]))
-            if acc.ttft is not None:
-                self.S["ttft"] = acc.ttft
-            elapsed = time.monotonic() - acc.started
-            out_tokens = (acc.usage or {}).get("completion_tokens") or len(acc.content_parts)
-            if elapsed > 0 and out_tokens:
-                self.S["tps"] = out_tokens / elapsed
 
             if not acc.tool_calls:
-                if on_token is None and (not self.S["chat"] or self.S["chat"][-1][0] != "ai"):
-                    self.S["chat"].append(("ai", acc.text))
                 final_text = acc.text
+                if interactive:
+                    write("\n\n")
+                    self.tui.print_footer(self.S["model"], took, "canceled" if canceled else "")
                 break
 
-            # Execute tool calls, then continue the conversation.
             final_text = ""
+            if interactive:
+                write("\n")
             for tc in msg.get("tool_calls", []):
                 fn = tc.get("function", {})
-                t0 = time.time()
-                result = self._run_tool_call(fn.get("name", ""), fn.get("arguments", ""))
-                ms = int((time.time() - t0) * 1000)
-                if on_token is None:
-                    self.hud.call(fn.get("name", "tool"), (fn.get("arguments", "") or "")[:30], ms)
+                name = fn.get("name", "")
+                args = fn.get("arguments", "") or ""
+                if interactive:
+                    self.tui.print_tool_header(name, args)
+                if not self._check_permission(name, args):
+                    result = "error: permission denied by user"
+                    if interactive:
+                        self.tui.print_tool_result("Permission denied", is_error=True)
+                else:
+                    t1 = time.time()
+                    result = self._run_tool_call(name, args)
+                    ms = int((time.time() - t1) * 1000)
+                    if interactive:
+                        self.tui.print_tool_result(result, is_error=result.startswith("error"))
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id") or "call_0",
                     "content": result,
                 })
-            if on_token is None:
-                self.hud.frame("tools")
+            t0 = time.monotonic()
         return final_text
 
     # -------------------------------------------------------------- one-shot
@@ -209,8 +245,10 @@ class App:
 
         text = self.ask(prompt, on_token=on_token)
         sys.stdout.write("\n")
-        meta = f"\n{D}— {self.S['model']} · ttft {self.S['ttft'] or 0:.2f}s · {self.S['tps'] or 0:.1f} tok/s · in/out {self.S['tin']}/{self.S['tout']}{R}\n"
         if not self.args.quiet:
+            took_tokens = self.S["tout"]
+            meta = "\n" + fg(MUTED) + "— %s · in/out %d/%d" % (
+                self.S["model"], self.S["tin"], took_tokens) + R + "\n"
             sys.stderr.write(meta)
         return 0 if text else 1
 
@@ -220,35 +258,35 @@ class App:
         cm = a[0].lower()
         arg = a[1] if len(a) > 1 else ""
         self.S["hist"].append((time.strftime("%H:%M"), p))
-        say = self.hud.say
+        say = lambda *ls: [write("  " + fg(MUTED) + l + R + "\n") for l in ls]
 
         if cm in ("/exit", "/quit"):
             return False
         if cm == "/help":
-            self.hud.page([c(self.acc) + B + "КОМАНДЫ" + R] + [c(self.acc) + k.ljust(13) + R + v for k, v in HELP + EXTRA])
+            lines = [fg(SECONDARY) + k.ljust(14) + R + fg(MUTED) + v + R for k, v in HELP + EXTRA]
+            self.tui.page("Команды", lines)
+        elif cm == "/init":
+            self._init_project()
+        elif cm == "/compact":
+            self._compact()
         elif cm == "/new":
             self.S["saved"][self.S["sess"]] = {"name": self.S["name"], "chat": self.S["chat"], "messages": self.messages}
             self.S["sess"] = max(list(self.S["saved"]) + [self.S["sess"]]) + 1
             self.S["name"] = "untitled"
             self.S["chat"] = []
             self._reset_messages()
+            say("новая сессия #%d" % self.S["sess"])
         elif cm in ("/clear", "/reset"):
             self.S["chat"] = []
             self.S["tin"] = self.S["tout"] = 0
             self._reset_messages()
-        elif cm == "/compact":
-            summary_text = "\n".join(f"{r}: {t}" for r, t in self.S["chat"][-20:])
-            self.S["chat"] = [("sys", "— контекст сжат —")]
-            self._reset_messages()
-            self.messages.append({"role": "user", "content": "Сводка предыдущего диалога:\n" + summary_text[:4000]})
-            self.S["tin"] = int(self.S["tin"] * 0.3)
-            self.S["tout"] = int(self.S["tout"] * 0.3)
+            say("контекст сброшен")
         elif cm == "/model":
             if arg:
                 self.S["model"] = arg
             else:
                 models = self._models()
-                j = self.hud.menu("Модель", [(m, "● текущая" if m == self.S["model"] else "") for m in models])
+                j = self.tui.dialog("Select Model", [(m, "current" if m == self.S["model"] else "") for m in models])
                 if j >= 0:
                     self.S["model"] = models[j]
             self.cfg.model = self.S["model"]
@@ -256,7 +294,7 @@ class App:
             say("модель: " + self.S["model"])
         elif cm == "/models":
             models = self._models()
-            self.hud.page([c(self.acc) + B + "МОДЕЛИ" + R] + [(c(114) + "● " if m == self.S["model"] else "  ") + m + R for m in models])
+            self.tui.page("Модели", [("● " if m == self.S["model"] else "  ") + m for m in models])
         elif cm == "/mode":
             if arg and normalize_mode(arg) in PROMPTS:
                 self.cfg.mode = normalize_mode(arg)
@@ -264,65 +302,56 @@ class App:
                 self._reset_messages_with_history()
                 say("режим: " + self.cfg.mode)
             else:
-                j = self.hud.menu("Режим", [(k, PROMPTS[k][:40] + "…") for k in PROMPTS])
+                j = self.tui.dialog("Mode", [(k, PROMPTS[k][:40] + "…") for k in PROMPTS])
                 if j >= 0:
                     self.cfg.mode = list(PROMPTS)[j]
                     self.cfg.save()
                     self._reset_messages_with_history()
                     say("режим: " + self.cfg.mode)
         elif cm == "/system":
-            if arg:
+            if arg.strip() == "reset":
+                self.cfg.system_prompt = None
+                self.cfg.save()
+                self._reset_messages_with_history()
+                say("системный промпт сброшен")
+            elif arg:
                 self.cfg.system_prompt = arg
                 self.cfg.save()
                 self._reset_messages_with_history()
                 say("системный промпт обновлён")
             else:
                 cur = self.cfg.system_prompt or system_prompt_for(self.cfg.mode)
-                self.hud.page([c(self.acc) + B + "SYSTEM PROMPT" + R, cur, "", D + "изменить: /system <текст> · сброс: /system reset" + R])
-                if arg == "reset":
-                    pass
-            if arg.strip() == "reset":
-                self.cfg.system_prompt = None
-                self.cfg.save()
-                self._reset_messages_with_history()
-                say("системный промпт сброшен")
+                self.tui.page("System prompt", [cur, "", "изменить: /system <текст> · сброс: /system reset"])
         elif cm == "/mcp":
             self._handle_mcp(arg)
         elif cm == "/tools":
-            self.tools_enabled = not self.tools_enabled
-            say("инструменты: " + ("вкл" if self.tools_enabled else "выкл"))
+            self._handle_tools(arg)
+        elif cm == "/permissions":
+            self._handle_permissions()
         elif cm in ("/key", "/auth"):
             self._change_key()
         elif cm == "/balance":
             self._show_balance()
         elif cm == "/cost":
-            say("in %d · out %d · ttft %.2fs · %.1f tok/s" % (
-                self.S["tin"], self.S["tout"], self.S.get("ttft") or 0.0, self.S.get("tps") or 0.0))
+            say("in %d · out %d" % (self.S["tin"], self.S["tout"]))
         elif cm == "/status":
             say("сессия #%d · %s · %s · режим %s · запросов %d" % (
                 self.S["sess"], self.S["name"], self.S["model"], self.cfg.mode, self.S["reqs"]))
         elif cm == "/history":
-            self.hud.page([c(self.acc) + B + "ВСЕ ЗАПРОСЫ" + R] + (
-                ["%s%2d%s %s %s" % (D, i + 1, R, tm, t) for i, (tm, t) in enumerate(self.S["hist"])] or ["—"]))
+            self.tui.page("Все запросы", ["%2d  %s %s" % (i + 1, tm, t) for i, (tm, t) in enumerate(self.S["hist"])] or ["—"])
         elif cm == "/sessions":
-            self.hud.page([c(self.acc) + B + "СЕССИИ" + R] + (
-                ["#%d %s (%d сообщ.)" % (k, v["name"], len(v["chat"])) for k, v in self.S["saved"].items()] or ["пока нет"]))
+            self.tui.page("Сессии", ["#%d %s (%d сообщ.)" % (k, v["name"], len(v["chat"])) for k, v in self.S["saved"].items()] or ["пока нет"])
         elif cm == "/resume":
             self._resume(arg)
-        elif cm == "/sidebar":
-            self.S["side"] = not self.S["side"]
-            self.cfg.data["sidebar"] = self.S["side"]
-            self.cfg.save()
-            if not self.S["side"]:
-                from .hud import size as _size
-                cols = _size().columns
-                if cols < 76:
-                    self.hud.page(self.hud.sidebar(cols - 6, "idle"))
         elif cm == "/theme":
-            self.acc = THEMES[(THEMES.index(self.acc) + 1) % len(THEMES)] if self.acc in THEMES else THEMES[0]
-            self.hud.acc = self.acc
-            self.cfg.data["theme"] = self.acc
-            self.cfg.save()
+            names = [n for n, _ in THEMES]
+            j = self.tui.dialog("Select Theme", [(n, "current" if n == self.theme else "") for n in names])
+            if j >= 0:
+                self.theme = names[j]
+                self.tui.primary = dict(THEMES)[self.theme]
+                self.cfg.data["theme"] = self.theme
+                self.cfg.save()
+                say("тема: " + self.theme)
         elif cm == "/copy":
             last = [t for r, t in self.S["chat"] if r == "ai"]
             if not last:
@@ -331,7 +360,6 @@ class App:
                 ok, tool = copy_to_clipboard(last[-1])
                 say("скопировано (%s)" % tool if ok else "буфер обмена недоступен (termux-api / xclip / clip)")
         elif cm == "/copycode":
-            import re
             last = [t for r, t in self.S["chat"] if r == "ai"]
             code = None
             if last:
@@ -343,11 +371,7 @@ class App:
                 ok, tool = copy_to_clipboard(code)
                 say("код скопирован (%s)" % tool if ok else "буфер обмена недоступен")
         elif cm == "/diff":
-            self.hud.call("bash", "git diff --stat")
             say(*git_diff_stat().splitlines()[:10])
-        elif cm == "/init":
-            open("NOVA.md", "w", encoding="utf-8").write("# NovaProxy\n\nзаметки проекта\n")
-            say("создан NOVA.md")
         elif cm == "/doctor":
             self._doctor()
         elif cm == "/export":
@@ -359,6 +383,7 @@ class App:
             say("неизвестная команда: " + cm + " (/help)")
         return True
 
+    # --------------------------------------------------------- command impls
     def _reset_messages_with_history(self) -> None:
         history = [m for m in self.messages if m["role"] != "system"]
         self._reset_messages()
@@ -368,13 +393,31 @@ class App:
         if not self.models:
             try:
                 self.models = self.client.list_models()
-            except ApiError as exc:
-                self.hud.say("не удалось получить модели: " + str(exc))
+            except ApiError:
                 self.models = [self.S["model"]]
         return self.models
 
+    def _init_project(self) -> None:
+        prompt = (
+            "Analyze this project and create a NOVA.md file (~20 lines) with: "
+            "build/lint/test commands, code style guidelines, project structure notes. "
+            "If NOVA.md exists, improve it. Use the write_file tool."
+        )
+        self.ask(prompt)
+
+    def _compact(self) -> None:
+        history = [m for m in self.messages if m["role"] != "system"]
+        if not history:
+            return
+        text = "\n".join("%s: %s" % (m.get("role", "?"), str(m.get("content") or "")[:500]) for m in history[-30:])
+        self._reset_messages()
+        self.messages.append({"role": "user", "content": "Сводка предыдущего диалога:\n" + text[:6000]})
+        self.S["tin"] = int(self.S["tin"] * 0.3)
+        self.S["tout"] = int(self.S["tout"] * 0.3)
+        write("  " + fg(MUTED) + "контекст сжат" + R + "\n")
+
     def _change_key(self) -> None:
-        write("\x1b[2J\x1b[H\n")
+        write("\n")
         def validate(k: str):
             return NovaClient(k).validate_key()
         try:
@@ -385,16 +428,15 @@ class App:
         self.cfg.save()
         self.client = NovaClient(key)
         self.models = []
-        self.hud.say("ключ обновлён")
+        write("  " + fg(MUTED) + "ключ обновлён" + R + "\n")
 
     def _show_balance(self) -> None:
         try:
             info = self.client.key_info()
         except ApiError as exc:
-            self.hud.say("ошибка: " + str(exc))
+            self.tui.page("Баланс", ["ошибка: " + str(exc)])
             return
         lines = [
-            c(self.acc) + B + "БАЛАНС КЛЮЧА" + R,
             "имя      " + str(info.get("name", "—")),
             "баланс   %s %s" % (info.get("balance", "—"), info.get("currency", "token")),
             "запросов %s" % info.get("request_count", "—"),
@@ -404,22 +446,22 @@ class App:
         models = info.get("allowed_models") or []
         if models:
             lines.append("модели   " + ", ".join(models[:8]) + (" …" if len(models) > 8 else ""))
-        self.hud.page(lines)
+        self.tui.page("Баланс ключа", lines)
 
     def _handle_mcp(self, arg: str) -> None:
-        say = self.hud.say
         parts = arg.split(maxsplit=1) if arg else []
         sub = parts[0] if parts else ""
         rest = parts[1] if len(parts) > 1 else ""
+        say = lambda *ls: [write("  " + fg(MUTED) + l + R + "\n") for l in ls]
         if not sub:
-            lines = [c(self.acc) + B + "MCP СЕРВЕРЫ" + R]
+            lines = []
             status = self.mcp.status_lines()
             if not status:
-                lines.append(D + "нет серверов · добавь: /mcp add <имя> <команда...>" + R)
+                lines.append("нет серверов · добавь: /mcp add <имя> <команда...>")
             for name, st in status:
-                lines.append("  " + c(114) + name.ljust(12) + R + st)
-            lines += ["", D + "/mcp add <имя> <cmd> · /mcp del <имя> · /mcp tools" + R]
-            self.hud.page(lines)
+                lines.append(name.ljust(14) + st)
+            lines += ["", "/mcp add <имя> <cmd> · /mcp del <имя> · /mcp tools"]
+            self.tui.page("MCP серверы", lines)
         elif sub == "add" and rest:
             name, _, cmdline = rest.partition(" ")
             if not cmdline:
@@ -442,19 +484,63 @@ class App:
                 say("сервер %s не найден" % rest)
         elif sub == "tools":
             tools = self.mcp.openai_tools()
-            self.hud.page([c(self.acc) + B + "MCP ИНСТРУМЕНТЫ" + R] + (
-                [t["function"]["name"] for t in tools] or ["нет"]))
+            self.tui.page("MCP инструменты", [t["function"]["name"] for t in tools] or ["нет"])
         else:
             say("формат: /mcp · /mcp add <имя> <cmd> · /mcp del <имя> · /mcp tools")
 
+    def _handle_tools(self, arg: str) -> None:
+        say = lambda *ls: [write("  " + fg(MUTED) + l + R + "\n") for l in ls]
+        if not arg:
+            self.tools_enabled = not self.tools_enabled
+            say("инструменты: " + ("вкл" if self.tools_enabled else "выкл"))
+            return
+        if arg == "list":
+            disabled = set(self.cfg.disabled_tools)
+            self.tui.page("Инструменты", [
+                (("✓ " if t["function"]["name"] not in disabled else "✗ ") + t["function"]["name"])
+                for t in BUILTIN_TOOLS
+            ])
+        elif arg.startswith("disable "):
+            name = arg.split(None, 1)[1]
+            d = list(self.cfg.disabled_tools)
+            if name not in d:
+                d.append(name)
+            self.cfg.disabled_tools = d
+            self.cfg.save()
+            say("отключён: " + name)
+        elif arg.startswith("enable "):
+            name = arg.split(None, 1)[1]
+            d = [x for x in self.cfg.disabled_tools if x != name]
+            self.cfg.disabled_tools = d
+            self.cfg.save()
+            say("включён: " + name)
+        else:
+            say("/tools · /tools list · /tools disable <имя> · /tools enable <имя>")
+
+    def _handle_permissions(self) -> None:
+        cur = self.cfg.permissions
+        j = self.tui.dialog("Permissions", [
+            ("bash: " + cur.get("bash", "ask"), "выполнение shell-команд"),
+            ("write: " + cur.get("write", "ask"), "запись и правка файлов"),
+            ("сбросить", "вернуть ask для всего"),
+        ])
+        if j == 0:
+            cur["bash"] = {"ask": "allow", "allow": "deny", "deny": "ask"}[cur.get("bash", "ask")]
+        elif j == 1:
+            cur["write"] = {"ask": "allow", "allow": "deny", "deny": "ask"}[cur.get("write", "ask")]
+        elif j == 2:
+            cur = {"bash": "ask", "write": "ask"}
+        self.cfg.permissions = cur
+        self.cfg.save()
+
     def _resume(self, arg: str) -> None:
-        say = self.hud.say
+        say = lambda *ls: [write("  " + fg(MUTED) + l + R + "\n") for l in ls]
         try:
             if arg:
                 k = int(arg)
             else:
                 ks = list(self.S["saved"])
-                j = self.hud.menu("Сессия", [("#%d" % k, self.S["saved"][k]["name"]) for k in ks])
+                j = self.tui.dialog("Switch Session", [("#%d" % k, self.S["saved"][k]["name"]) for k in ks])
                 if j < 0:
                     return
                 k = ks[j]
@@ -464,20 +550,18 @@ class App:
             self.S["name"] = v["name"]
             self.S["chat"] = v["chat"]
             self.messages = v.get("messages", self.messages)
+            say("сессия #%d восстановлена" % k)
         except Exception:
             say("нет сохранённых сессий (см. /sessions)")
 
     def _doctor(self) -> None:
         import platform
-        from .hud import size as _size
-        cl, rw = _size()
+        cols = os.get_terminal_size().columns if hasattr(os, "get_terminal_size") else 80
         termux = "да" if "com.termux" in os.environ.get("PREFIX", "") else "нет"
         ok, err = self.client.validate_key()
-        self.hud.page([
-            c(self.acc) + B + "DOCTOR" + R,
+        self.tui.page("Doctor", [
             "python   " + sys.version.split()[0],
             "platform " + platform.system().lower(),
-            "term     %dx%d" % (cl, rw),
             "termux   " + termux,
             "key      " + ("ok" if ok else "ошибка: " + err),
             "model    " + self.S["model"],
@@ -485,38 +569,46 @@ class App:
             "mcp      %d серверов" % len(self.mcp.servers),
         ])
 
+    def _shell(self, cmd: str) -> None:
+        self.S["hist"].append((time.strftime("%H:%M"), "!" + cmd))
+        self.S["reqs"] += 1
+        self.tui.print_tool_header("Bash", cmd)
+        t = time.time()
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            out = (r.stdout + r.stderr).strip()
+        except Exception as e:
+            out = str(e)
+        self.tui.print_tool_result(out or "(пусто)")
+        write("\n")
+
     # ------------------------------------------------------------------ repl
     def repl(self) -> int:
-        try:
-            import readline as rl
-            rl.set_completer(lambda t, s: ([x for x in CMDS if x.startswith(t)] + [None])[s])
-            rl.set_completer_delims(" ")
-            rl.parse_and_bind("tab: complete")
-            prompt = "\001" + c(114) + B + "\002 ❯ \001" + R + "\002"
-        except Exception:
-            prompt = c(114) + B + " ❯ " + R
-
-        if not self.args.no_boot:
-            boot()
+        write("\x1b[2J\x1b[H")
+        self.tui.print_banner(__version__, "https://novaproxy.duckdns.org", os.getcwd(), self.S["model"])
 
         if self.mcp.specs:
-            self.mcp.connect_all(on_event=lambda n, s: self.hud.say("mcp %s: %s" % (n, s)))
+            events: List[str] = []
+            self.mcp.connect_all(on_event=lambda n, s: events.append("mcp %s: %s" % (n, s)))
+            for e in events:
+                write("  " + fg(MUTED) + e + R + "\n")
+            write("\n")
 
-        write("\x1b[2J")
+        from .input import InputReader
+        reader = InputReader(CMDS, self.tui, self.S)
+
         while True:
-            self.hud.frame()
-            try:
-                p = input(prompt).strip()
-            except (EOFError, KeyboardInterrupt):
+            p = reader.read()
+            if p is None:
                 break
-            write(R)
-            if p in ("", "/"):
-                j = self.hud.menu("Команды", HELP)
+            p = p.strip()
+            if not p:
+                continue
+            if p == "/":
+                j = self.tui.dialog("Commands", HELP)
                 if j < 0:
-                    write("\x1b[2J")
                     continue
                 p = HELP[j][0]
-                write("\x1b[2J")
             if p.startswith("/"):
                 if not self.handle(p):
                     break
@@ -524,23 +616,9 @@ class App:
                 self._shell(p[1:])
             else:
                 self.ask(p)
-            write("\x1b[2J")
-        write("\x1b[2J\x1b[H" + R)
+        write("\n")
         self.mcp.close_all()
         return 0
-
-    def _shell(self, cmd: str) -> None:
-        self.S["hist"].append((time.strftime("%H:%M"), "!" + cmd))
-        self.S["reqs"] += 1
-        self.S["chat"].append(("user", "!" + cmd))
-        t = time.time()
-        try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
-            out = (r.stdout + r.stderr).strip().splitlines()[:14]
-        except Exception as e:
-            out = [str(e)]
-        self.S["calls"].append({"n": "bash", "a": cmd, "st": "ok", "ms": int((time.time() - t) * 1000)})
-        self.hud.say(*(out or ["(пусто)"]))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -556,8 +634,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="reasoning_effort для gpt-6-astra")
     p.add_argument("--key", help="задать API-ключ px_live_... и выйти")
     p.add_argument("--auth", action="store_true", help="сменить API-ключ интерактивно")
-    p.add_argument("--no-boot", action="store_true", help="пропустить заставку")
-    p.add_argument("--no-stream", action="store_true", help="не использовать стриминг")
     p.add_argument("--quiet", "-q", action="store_true", help="не печатать мета-строку в one-shot")
     p.add_argument("--version", action="store_true", help="версия")
     return p
@@ -567,7 +643,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.version:
-        from . import __version__
         print("novaproxy " + __version__)
         return 0
 
@@ -586,14 +661,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Ключ сохранён в ~/.novaproxy/config.json")
         return 0
 
+    def validate(k: str):
+        return NovaClient(k).validate_key()
+
+    # First-run / auth: no key -> ask. Existing key -> verify once; if the
+    # server rejects it (revoked/expired), ask again instead of dying.
     if not cfg.api_key or args.auth:
-        def validate(k: str):
-            return NovaClient(k).validate_key()
         key = prompt_for_key(validate)
         cfg.api_key = key
         cfg.save()
-        if args.auth:
+        if args.auth and not args.prompt:
             return 0
+    else:
+        ok, err = validate(cfg.api_key)
+        if not ok:
+            print("Сохранённый ключ отклонён (%s). Введите новый." % err, file=sys.stderr)
+            key = prompt_for_key(validate)
+            cfg.api_key = key
+            cfg.save()
 
     if args.system:
         cfg.system_prompt = args.system
@@ -605,7 +690,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.model:
         app.S["model"] = args.model
 
-    # one-shot: argv prompt or piped stdin
     piped = None
     if not sys.stdin.isatty() and not args.prompt:
         data = sys.stdin.read()

@@ -1,49 +1,58 @@
-"""Terminal HUD — faithful port of the reference testCli.py interface.
+"""Terminal HUD styled after the OpenCode TUI.
 
-All visuals (banner art, boot splash, sidebar, frame, menus, colors) are
-carried over 1:1 from the prototype; only the data sources are real.
+Design faithfully ported from opencode-ai/opencode (bubbletea original):
+  - dark truecolor palette (Primary #fab283, Secondary #5c9cf5, ...)
+  - centered startup banner with logo, server URL and cwd
+  - messages with a thick left border (┃), orange for the assistant,
+    blue for the user, muted for tool calls
+  - assistant footer ` <model> (1.2s)` in muted text
+  - working indicator: spinner + Thinking.../Generating.../...
+  - bottom status bar with chips (help / tokens / model)
+  - centered overlay dialogs with rounded borders (╭╮╰╯)
 """
 
 from __future__ import annotations
 
 import os
-import random
 import re
-import select
 import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
-
-try:
-    import termios
-    import tty
-    _HAS_TERMIOS = True
-except ImportError:  # Windows
-    termios = None  # type: ignore
-    tty = None  # type: ignore
-    _HAS_TERMIOS = False
-
-try:
-    import readline
-except ImportError:
-    try:
-        import pyreadline3 as readline  # type: ignore
-    except ImportError:
-        readline = None  # type: ignore
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 R = "\x1b[0m"
 B = "\x1b[1m"
-D = "\x1b[38;5;244m"
+I = "\x1b[3m"
+U = "\x1b[4m"
 
+# ---- opencode dark theme -------------------------------------------------
+PRIMARY = (250, 178, 131)    # #fab283
+SECONDARY = (92, 156, 245)   # #5c9cf5
+ACCENT = (157, 124, 216)     # #9d7cd8
+ERR = (224, 108, 117)        # #e06c75
+WARN = (245, 167, 66)        # #f5a742
+OK = (127, 216, 143)         # #7fd88f
+INFO = (86, 182, 194)        # #56b6c2
+TEXT = (224, 224, 224)       # #e0e0e0
+MUTED = (106, 106, 106)      # #6a6a6a
+EMPH = (229, 192, 123)       # #e5c07b
+BGD = (33, 33, 33)           # #212121
+BGD2 = (37, 37, 37)          # #252525
+DARKER = (18, 18, 18)        # #121212
+BORD = (75, 76, 92)          # #4b4c5c
 
-def c(n: int) -> str:
-    return "\x1b[38;5;%dm" % n
+THEMES = [
+    ("opencode", PRIMARY),
+    ("emerald", OK),
+    ("violet", ACCENT),
+    ("cyan", INFO),
+    ("amber", WARN),
+]
 
-
-THEMES = [141, 114, 203, 39, 221, 208]
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧"
 
 GLYPHS = {
     "N": ["███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"],
@@ -51,84 +60,22 @@ GLYPHS = {
     "V": ["██╗   ██╗", "██║   ██║", "██║   ██║", "╚██╗ ██╔╝", " ╚████╔╝ ", "  ╚═══╝  "],
     "A": [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
     "P": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
-    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
+    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
     "X": ["██╗  ██╗", "╚██╗██╔╝", " ╚███╔╝ ", " ██╔██╗ ", "██╔╝ ██╗", "╚═╝  ╚═╝"],
     "Y": ["██╗   ██╗", "██║ ██╔╝", " ╚████╔╝ ", "  ╚██╔╝  ", "   ██║   ", "   ╚═╝   "],
 }
-GR = [201, 177, 141, 105, 69, 39]
 
-# ASCII splash embedded in the binary so the boot works from any cwd
-# (the prototype read it from $TMPDIR/fsoc.txt).
-SPLASH_MAIN = r"""
-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-XX                                                                          XX
-XX   MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMMMMMMMMMMssssssssssssssssssssssssssMMMMMMMMMMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMMMMMss'''                          '''ssMMMMMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMyy''                                    ''yyMMMMMMMMMMMM   XX
-XX   MMMMMMMMyy''                                            ''yyMMMMMMMM   XX
-XX   MMMMMy''                                                    ''yMMMMM   XX
-XX   MMMy'                                                          'yMMM   XX
-XX   Mh'                                                              'hM   XX
-XX   -                                                                  -   XX
-XX                                                                          XX
-XX   ::                                                                ::   XX
-XX   MMhh.        ..hhhhhh..                      ..hhhhhh..        .hhMM   XX
-XX   MMMMMh   ..hhMMMMMMMMMMhh.                .hhMMMMMMMMMMhh..   hMMMMM   XX
-XX   ---MMM .hMMMMdd:::dMMMMMMMhh..        ..hhMMMMMMMd:::ddMMMMh. MMM---   XX
-XX   MMMMMM MMmm''      'mmMMMMMMMMyy.  .yyMMMMMMMMmm'      ''mmMM MMMMMM   XX
-XX   ---mMM ''             'mmMMMMMMMM  MMMMMMMMmm'             '' MMm---   XX
-XX   yyyym'    .              'mMMMMm'  'mMMMMm'              .    'myyyy   XX
-XX   mm''    .y'     ..yyyyy..  ''''      ''''  ..yyyyy..     'y.    ''mm   XX
-XX           MN    .sMMMMMMMMMss.   .    .   .ssMMMMMMMMMs.    NM           XX
-XX           N`    MMMMMMMMMMMMMN   M    M   NMMMMMMMMMMMMM    `N           XX
-XX            +  .sMNNNNNMMMMMN+   `N    N`   +NMMMMMNNNNNMs.  +            XX
-XX              o+++     ++++Mo    M      M    oM++++     +++o              XX
-XX                                oo      oo                                XX
-XX           oM                 oo          oo                 Mo           XX
-XX         oMMo                M              M                oMMo         XX
-XX       +MMMM                 s              s                 MMMM+       XX
-XX     +MMMMM+            +++NNNN+        +NNNN+++            +MMMMM+      XX
-XX     MMMMMMMMMNN+++NNMMMMMMMMMMMMMMNNNNMMMMMMMMMMMMMMNN+++NNMMMMMMMMM     XX
-XX     yMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMy     XX
-XX   m  yMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMy  m   XX
-XX   MMm yMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMy mMM   XX
-XX   MMMm .yyMMMMMMMMMMMMMMMM     MMMMMMMMMM     MMMMMMMMMMMMMMMMyy. mMMM   XX
-XX   MMMMd   ''''hhhhh       odddo          obbbo        hhhh''''   dMMMM   XX
-XX   MMMMMd             'hMMMMMMMMMMddddddMMMMMMMMMMh'             dMMMMM   XX
-XX   MMMMMMd              'hMMMMMMMMMMMMMMMMMMMMMMh'              dMMMMMM   XX
-XX   MMMMMMM-               ''ddMMMMMMMMMMMMMMdd''               -MMMMMMM   XX
-XX   MMMMMMMM                   '::dddddddd::'                   MMMMMMMM   XX
-XX   MMMMMMMM-                                                  -MMMMMMMM   XX
-XX   MMMMMMMMM                                                  MMMMMMMMM   XX
-XX   MMMMMMMMMy                                                yMMMMMMMMM   XX
-XX   MMMMMMMMMMy.                                            .yMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMy.                                        .yMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMMMy.                                    .yMMMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMMMMMs.                                .sMMMMMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMMMMMMMss.           ....           .ssMMMMMMMMMMMMMMMMMM   XX
-XX   MMMMMMMMMMMMMMMMMMMMNo         oNNNNo         oNMMMMMMMMMMMMMMMMMMMM   XX
-XX                                                                          XX
-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-""".strip("\n").split("\n")
 
-SPLASH_SUB = r"""
-    .o88o.                               o8o                .
-    888 `"                               `"'              .o8
-   o888oo   .oooo.o  .ooooo.   .ooooo.  oooo   .ooooo.  .o888oo oooo    ooo
-    888    d88(  "8 d88' `88b d88' `"Y8 `888  d88' `88b   888    `88.  .8'
-    888    `"Y88b.  888   888 888        888  888ooo888   888     `88..8'
-    888    o.  )88b 888   888 888   .o8  888  888    .o   888 .    `888'
-   o888o   8""888P' `Y8bod8P' `Y8bod8P' o888o `Y8bod8P'   "888"      d8'
-                                                                .o...P'
-                                                                `XER0'
-""".strip("\n").split("\n")
+def fg(t: Tuple[int, int, int]) -> str:
+    return "\x1b[38;2;%d;%d;%dm" % t
 
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧"
+
+def bgc(t: Tuple[int, int, int]) -> str:
+    return "\x1b[48;2;%d;%d;%dm" % t
 
 
 def size() -> os.terminal_size:
-    return shutil.get_terminal_size((50, 24))
+    return shutil.get_terminal_size((80, 24))
 
 
 def vl(s: str) -> int:
@@ -160,259 +107,312 @@ def write(s: str) -> None:
     sys.stdout.flush()
 
 
-def word(s: str) -> List[str]:
-    return ["".join(GLYPHS[ch][i] for ch in s) for i in range(6)]
+def fmt_dur(seconds: float) -> str:
+    if seconds < 1:
+        return "%dms" % int(seconds * 1000)
+    if seconds < 60:
+        return "%.1fs" % seconds
+    return "%.1fm" % (seconds / 60)
 
 
-def art(w: int) -> List[str]:
-    if w >= 82:
-        return word("NOVAPROXY")
-    if w >= 44:
-        return word("NOVA") + [""] + word("PROXY")
-    return []
-
-
+# ---------------------------------------------------------------- keyboard
 def key() -> str:
-    if not _HAS_TERMIOS:
-        ch = sys.stdin.read(1)
+    """Read one keypress (arrows normalized to \\x1b[A etc.)."""
+    if os.name == "nt":
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            ch2 = msvcrt.getwch()
+            return {"H": "\x1b[A", "P": "\x1b[B", "K": "\x1b[D", "M": "\x1b[C"}.get(ch, "")
         return ch
+    import termios
+    import tty
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
         ch = os.read(fd, 1).decode(errors="ignore")
-        if ch == "\x1b" and select.select([fd], [], [], 0.05)[0]:
-            ch += os.read(fd, 2).decode(errors="ignore")
+        if ch == "\x1b":
+            import select
+            if select.select([fd], [], [], 0.05)[0]:
+                ch += os.read(fd, 2).decode(errors="ignore")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     return ch
 
 
-def shrink(L: List[str], cols: int, rows: int) -> List[str]:
-    w = max(len(l) for l in L)
-    k = max(1, -(-w // (cols - 1)), -(-len(L) // (rows - 1)))
-    if k == 1:
-        return L
-    out = []
-    for r in range(0, len(L), k):
-        blk = L[r : r + k]
-        line = ""
-        for x in range(0, w, k):
-            ch = [b[x + j] for b in blk for j in range(k) if x + j < len(b) and b[x + j] != " "]
-            line += max(set(ch), key=ch.count) if len(ch) * 3 >= k * k else " "
-        out.append(line)
-    return out
+class CancelListener:
+    """Background key listener used during streaming; ESC/Ctrl+C cancels."""
+
+    def __init__(self) -> None:
+        self.pressed: Optional[str] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ok = sys.stdin.isatty() and os.name != "nt"
+
+    def start(self) -> None:
+        if not self._ok:
+            return
+        try:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        import select
+        import termios
+        import tty
+        try:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            tty.setraw(fd)
+            while not self._stop.is_set():
+                if select.select([fd], [], [], 0.1)[0]:
+                    ch = os.read(fd, 1).decode(errors="ignore")
+                    if ch in ("\x1b", "\x03"):
+                        self.pressed = ch
+                        return
+        except Exception:
+            return
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.3)
 
 
-def flash(m: List[str]) -> None:
-    cols, rows = size()
-    if not m:
-        return
-    a = shrink(m, cols, rows)
-    w = max(len(l) for l in a)
-    left = max(0, (cols - w) // 2)
-    top = max(0, (rows - len(a)) // 2)
-    pal = [46, 46, 40, 34, 46, 82, 46, 28, 46, 46]
-    for i in range(10):
-        if i in (2, 6):
-            write("\x1b[2J\x1b[H")
-            time.sleep(0.05)
-            continue
-        o = c(pal[i]) + "\x1b[2J\x1b[H" + "\n" * top
-        for l in a:
-            sh = random.randint(-4, 4) if i in (3, 7) and random.random() < 0.4 else 0
-            o += " " * max(0, left + sh) + l + "\n"
-        write(o)
-        time.sleep(0.05)
-    write(R + "\x1b[2J\x1b[H")
+# ---------------------------------------------------------------- banner
+class Tui:
+    def __init__(self, primary: Tuple[int, int, int] = PRIMARY) -> None:
+        self.primary = primary
 
+    # -- banner ------------------------------------------------------------
+    def banner_art(self) -> List[str]:
+        return ["".join(GLYPHS[ch][i] for ch in "NOVAPROXY") for i in range(6)]
 
-def blink(f: List[str]) -> None:
-    cols, rows = size()
-    w = 0
-    if f:
-        ind = min(len(l) - len(l.lstrip()) for l in f if l.strip())
-        f = [l[ind:] for l in f]
-        w = max(len(l) for l in f)
-    if not f or w > cols - 1:
-        f = ["f s o c i e t y"]
-        w = len(f[0])
-    left = max(0, (cols - w) // 2)
-    top = max(0, (rows - len(f)) // 2)
-    on = c(46) + B + "\x1b[2J\x1b[H" + "\n" * top + "".join(" " * left + l + "\n" for l in f) + R
-    for _ in range(5):
-        write(on)
-        time.sleep(0.06)
-        write("\x1b[2J\x1b[H")
-        time.sleep(0.04)
-
-
-def boot() -> None:
-    write("\x1b[?25l")
-    try:
-        flash(SPLASH_MAIN)
-        blink(SPLASH_SUB)
-    finally:
-        write("\x1b[2J\x1b[H" + R + "\x1b[?25h")
-
-
-class Hud:
-    """Live terminal frame: chat pane + sidebar + input separator."""
-
-    def __init__(self, state: Dict[str, Any], accent: int = 141, green: int = 114) -> None:
-        self.S = state
-        self.acc = accent
-        self.grn = green
-
-    # ---------------------------------------------------------------- state
-    def say(self, *ls: str) -> None:
-        for l in ls:
-            self.S["chat"].append(("sys", l))
-
-    def call(self, n: str, a: str, ms: Optional[int] = None, ok: bool = True) -> None:
-        cl = {"n": n, "a": a, "st": "ok" if ok else "run", "ms": ms or 0}
-        self.S["calls"].append(cl)
-        self.S["chat"].append(("tool", "%s %s  ✓ %dms" % (n, a, cl["ms"])))
-
-    # ---------------------------------------------------------------- render
-    def sidebar(self, W: int, status: str) -> List[str]:
-        a = c(self.acc)
-        L: List[str] = []
-
-        def h(t: str) -> None:
-            L.append(a + B + t + R)
-
-        def row(k: str, v: Any) -> None:
-            L.append(D + k.ljust(7) + R + str(v)[: max(1, W - 7)])
-
-        S = self.S
-        h("▌ SESSION #%d" % S["sess"])
-        row("name", S["name"])
-        row("model", S["model"])
-        row("status", status)
-        row("reqs", S["reqs"])
-        row("in/out", "%d/%d" % (S["tin"], S["tout"]))
-        ctx = S["tin"] + S["tout"]
-        n = min(12, int(ctx / 8000 * 12) + (1 if ctx else 0))
-        L.append(D + "ctx    " + R + a + "█" * n + D + "░" * (12 - n) + R + " 8k")
-        if S.get("ttft") is not None:
-            row("ttft", "%.2fs" % S["ttft"])
-        if S.get("tps") is not None:
-            row("speed", "%.1f t/s" % S["tps"])
-        row("uptime", "%ds" % (time.time() - S["t0"]))
-        L.append("")
-        h("TOOLS")
-        if not S["calls"]:
-            L.append(D + "—" + R)
-        for cl in S["calls"][-6:]:
-            ic = (c(self.grn) + "✓") if cl["st"] == "ok" else (c(221) + "…")
-            L.append(ic + R + " " + (cl["n"] + " " + cl["a"])[: W - 9] + D + " %dms" % cl["ms"] + R)
-        L.append("")
-        h("HISTORY")
-        if not S["hist"]:
-            L.append(D + "—" + R)
-        for tm, t in S["hist"][-8:]:
-            L.append(D + tm + R + " " + t[: W - 6])
-        return L
-
-    def chatlines(self, MW: int) -> List[str]:
-        L: List[str] = []
-        for role, t in self.S["chat"]:
-            if role == "user":
-                pre = c(self.grn) + B + "❯ " + R
-            elif role == "ai":
-                pre = c(self.acc) + "▌ " + R
-            elif role == "tool":
-                pre = D + "  ⚙ "
-            else:
-                pre = D + "  "
-            ws = textwrap.wrap(t, max(10, MW - 5)) or [""]
-            for i, x in enumerate(ws):
-                L.append((pre if (i == 0 or role == "ai") else "  ") + x + R)
-            if role in ("user", "ai"):
-                L.append("")
-        return L
-
-    def frame(self, status: str = "idle") -> None:
-        cols, rows = size()
-        side = self.S["side"] and cols >= 76
-        SW = 30 if side else 0
-        MW = cols - SW - 3 if side else cols - 1
-        H = max(5, rows - 3)
-        if not self.S["chat"]:
-            a = art(MW)
-            left = [ctr(c(GR[min(5, k * 6 // max(1, len(a)))]) + B + l + R, MW) for k, l in enumerate(a)]
-            if not a:
-                left = [ctr(c(self.acc) + B + "NOVAPROXY" + R, MW)]
-            left += ["", ctr(D + "введи запрос · / или Enter = меню" + R, MW)]
-            left = [""] * max(0, (H - len(left)) // 2) + left
+    def print_banner(self, version: str, url: str, cwd: str, model: str) -> None:
+        cols = size().columns
+        art = self.banner_art()
+        aw = len(art[0])
+        out = ["", ""]
+        if aw + 2 <= cols:
+            grad = [self.primary, (247, 165, 122), (244, 152, 113), (238, 140, 105), (233, 127, 96), (227, 114, 88)]
+            for i, ln in enumerate(art):
+                out.append(ctr(fg(grad[i % len(grad)]) + B + ln + R, cols))
         else:
-            left = self.chatlines(MW)[-H:]
-        right = self.sidebar(SW, status) if side else []
-        sep = " " + c(240) + "│" + R + " "
-        o = "\x1b[H"
-        for i in range(H):
-            l = left[i] if i < len(left) else ""
-            r = right[i] if i < len(right) else ""
-            line = clip(pad(l, MW), MW) + ((sep + clip(r, SW)) if side else "")
-            o += clip(line, cols - 1) + "\x1b[K\n"
-        o += clip(c(self.acc) + "─── ввод " + "─" * cols, cols - 1) + "\x1b[K\n\x1b[J"
-        write(o)
+            out.append(ctr(fg(self.primary) + B + "⌬ NovaProxy" + R, cols))
+        out.append("")
+        out.append(ctr(fg(MUTED) + "NovaProxy CLI " + version + R, cols))
+        out.append(ctr(fg(MUTED) + url + R, cols))
+        out.append(ctr(fg(MUTED) + "cwd: " + cwd + R, cols))
+        out.append(ctr(fg(MUTED) + "model: " + model + R, cols))
+        out.append("")
+        out.append(ctr(fg(MUTED) + "enter — отправить" + fg(MUTED) + " · " + R
+                       + fg(TEXT) + "/" + fg(MUTED) + " — команды · " + R
+                       + fg(TEXT) + "@file" + fg(MUTED) + " — прикрепить · " + R
+                       + fg(TEXT) + "esc" + fg(MUTED) + " — отмена генерации" + R, cols))
+        out.append("")
+        write("\n".join(out) + "\n")
 
-    # ---------------------------------------------------------------- menus
-    def menu(self, title: str, items: List[Tuple[str, str]]) -> int:
+    # -- messages ------------------------------------------------------------
+    def _border_lines(self, text: str, color: Tuple[int, int, int], width: int) -> List[str]:
+        pre = fg(color) + "┃ " + R
+        lines = []
+        for raw in text.split("\n"):
+            wrapped = textwrap.wrap(raw, max(10, width - 4),
+                                    replace_whitespace=False, drop_whitespace=False) or [""]
+            lines.extend(pre + fg(TEXT) + w + R for w in wrapped)
+        return lines
+
+    def print_user_message(self, text: str) -> None:
+        w = size().columns
+        for ln in self._border_lines(text, SECONDARY, w):
+            write(ln + "\n")
+        write("\n")
+
+    def print_assistant_markdown(self, text: str) -> None:
+        """Render the finished assistant message as markdown with an orange border."""
+        from .render import render_to_string
+        w = size().columns
+        body = render_to_string(text, max(20, w - 4)).rstrip("\n")
+        pre = fg(self.primary) + "┃ " + R
+        for ln in body.split("\n"):
+            write(pre + ln + R + "\n")
+
+    def print_footer(self, model: str, took: float, note: str = "") -> None:
+        extra = (" (" + note + ")") if note else (" (%s)" % fmt_dur(took))
+        write(fg(MUTED) + " " + model + extra + R + "\n\n")
+
+    # -- tool calls ----------------------------------------------------------
+    TOOL_NAMES = {
+        "bash": "Bash", "read_file": "View", "write_file": "Write", "edit_file": "Edit",
+        "search": "Grep", "list_dir": "List", "web_search": "Fetch",
+    }
+    TOOL_ACTIONS = {
+        "bash": "Building command...", "read_file": "Reading file...",
+        "write_file": "Preparing write...", "edit_file": "Preparing edit...",
+        "search": "Searching content...", "list_dir": "Listing directory...",
+        "web_search": "Fetching...",
+    }
+
+    def tool_name(self, name: str) -> str:
+        if name.startswith("mcp__"):
+            return name.split("__", 2)[-1]
+        return self.TOOL_NAMES.get(name, name)
+
+    def print_tool_header(self, name: str, params: str) -> None:
+        disp = self.TOOL_NAMES.get(name, name)
+        if name.startswith("mcp__"):
+            disp = name.split("__", 2)[-1]
+        short = params if len(params) <= 60 else params[:57] + "..."
+        write(fg(MUTED) + "┃ " + B + disp + ": " + R + fg(MUTED) + short + R + "\n")
+
+    def print_tool_result(self, result: str, is_error: bool = False, max_lines: int = 10) -> None:
+        w = size().columns
+        pre = fg(MUTED) + "┃ " + R
+        if is_error:
+            flat = " ".join(result.split())[: w - 6]
+            write(pre + fg(ERR) + "Error: " + flat + R + "\n")
+            return
+        lines = result.split("\n")[:max_lines]
+        for ln in lines:
+            write(pre + clip(fg(MUTED) + ln, w - 3) + "\n")
+        if len(result.split("\n")) > max_lines:
+            write(pre + fg(MUTED) + I + "… (%d more lines)" % (len(result.split("\n")) - max_lines) + R + "\n")
+
+    # -- working indicator ---------------------------------------------------
+    def working(self, frame: int, task: str) -> None:
+        write("\r\x1b[K" + fg(self.primary) + B + SPINNER[frame % len(SPINNER)] + " " + task + R)
+        time.sleep(0.06)
+
+    def clear_working(self) -> None:
+        write("\r\x1b[K")
+
+    # -- status bar (prompt_toolkit bottom toolbar) ---------------------------
+    def status_bar(self, sess_name: str, model: str, tin: int, tout: int, mode: str) -> str:
+        cols = size().columns
+        help_chip = bgc(MUTED) + fg(DARKER) + B + " ctrl+c выход · / меню " + R
+        tok_chip = bgc(TEXT) + fg(BGD2) + " Tokens: %d/%d " % (tin, tout) + R
+        mode_chip = bgc(BGD2) + fg(MUTED) + " " + sess_name + " · " + mode + " " + R
+        model_chip = bgc(SECONDARY) + fg(BGD) + B + " " + model + " " + R
+        fixed = vl(help_chip) + vl(tok_chip) + vl(mode_chip) + vl(model_chip)
+        fill = bgc(BGD2) + " " * max(1, cols - fixed) + R
+        return help_chip + tok_chip + fill + mode_chip + model_chip
+
+    # -- dialogs ---------------------------------------------------------------
+    def dialog(self, title: str, items: List[Tuple[str, str]], footer: str = "↑↓ / j k · enter · q") -> int:
+        """Centered overlay menu, rounded border, inverted selection. Returns index or -1."""
         i = 0
         while True:
             cols, rows = size()
-            vis = max(3, rows - 6)
+            width = max(40, min(cols - 4, max([vl(t) + vl(d) + 8 for t, d in items] + [vl(title) + 8])))
+            vis = max(3, min(10, rows - 10, len(items)))
             st = max(0, min(i - vis // 2, len(items) - vis))
-            o = "\x1b[2J\x1b[H\n"
-            o += "  " + c(self.acc) + B + title + R + "\n\n"
+            box: List[str] = []
+            border = fg(MUTED)
+            box.append(border + "╭" + "─" * (width - 2) + "╮" + R)
+            inner = " " + pad(fg(self.primary) + B + title + R, width - 4) + " "
+            box.append(border + "│" + R + inner + border + "│" + R)
+            box.append(border + "│" + R + " " * (width - 2) + border + "│" + R)
             for j in range(st, min(len(items), st + vis)):
-                lb, ds = items[j]
+                t, d = items[j]
+                line = " " + pad(t + ("  " + d if d else ""), width - 4) + " "
                 if j == i:
-                    o += clip("  " + c(self.acc) + B + "❯ " + lb.ljust(13) + R + c(self.acc) + ds + R, cols - 1) + "\n"
+                    line = bgc(self.primary) + fg(BGD) + B + line + R
                 else:
-                    o += clip("    " + D + lb.ljust(13) + ds + R, cols - 1) + "\n"
-            o += "\n  " + D + "↑↓ / j k · enter · q" + R
-            write(o)
+                    line = fg(TEXT) + t + R + (fg(MUTED) + "  " + d if d else "") + R
+                    line = " " + pad(line, width - 4) + " "
+                box.append(border + "│" + R + line + border + "│" + R)
+            if len(items) > vis:
+                ind = fg(self.primary) + B + ("↑ " if st > 0 else "  ") + ("↓" if st + vis < len(items) else " ")
+                box.append(border + "│" + R + " " * (width - 6) + pad(ind, 3) + " " + border + "│" + R)
+            box.append(border + "│" + R + " " * (width - 2) + border + "│" + R)
+            box.append(border + "╰" + "─" * (width - 2) + "╯" + R)
+            top = max(0, (rows - len(box)) // 2)
+            out = "\x1b[2J\x1b[H" + "\n" * top
+            for ln in box:
+                out += ctr(ln, cols) + "\n"
+            out += "\n" + ctr(fg(MUTED) + footer + R, cols)
+            write(out)
             k = key()
             if k in ("\x1b[A", "k"):
                 i = (i - 1) % len(items)
             elif k in ("\x1b[B", "j"):
                 i = (i + 1) % len(items)
             elif k in ("\r", "\n"):
+                write("\x1b[2J\x1b[H")
                 return i
             elif k in ("q", "\x1b", "\x03"):
+                write("\x1b[2J\x1b[H")
                 return -1
 
-    def page(self, lines: List[str]) -> None:
-        write("\x1b[2J\x1b[H\n")
+    def confirm(self, title: str, question: str, options: List[str] = None) -> int:
+        """Centered confirm dialog; returns selected option index (default last = cancel)."""
+        options = options or ["Yes", "No"]
+        sel = len(options) - 1
+        while True:
+            cols, rows = size()
+            width = max(46, min(cols - 4, vl(question) + 8))
+            box: List[str] = []
+            border = fg(MUTED)
+            box.append(border + "╭" + "─" * (width - 2) + "╮" + R)
+            box.append(border + "│" + R + " " + pad(fg(self.primary) + B + title + R, width - 4) + " " + border + "│" + R)
+            box.append(border + "│" + R + " " * (width - 2) + border + "│" + R)
+            for qline in question.split("\n"):
+                for wline in textwrap.wrap(qline, width - 6) or [""]:
+                    box.append(border + "│" + R + "  " + pad(fg(TEXT) + wline + R, width - 6) + "  " + border + "│" + R)
+            box.append(border + "│" + R + " " * (width - 2) + border + "│" + R)
+            btns = ""
+            for idx, o in enumerate(options):
+                if idx == sel:
+                    btns += bgc(self.primary) + fg(BGD) + B + " " + o + " " + R + "  "
+                else:
+                    btns += bgc(BGD2) + fg(self.primary) + " " + o + " " + R + "  "
+            box.append(border + "│" + R + pad("", width - 4 - vl(btns)) + btns.rstrip() + "  " + border + "│" + R)
+            box.append(border + "╰" + "─" * (width - 2) + "╯" + R)
+            top = max(0, (rows - len(box)) // 2)
+            out = "\x1b[2J\x1b[H" + "\n" * top
+            for ln in box:
+                out += ctr(ln, cols) + "\n"
+            write(out)
+            k = key()
+            if k in ("\x1b[D", "h", "\t", "\x1b[C", "l"):
+                sel = (sel + 1) % len(options)
+            elif k in ("\r", "\n", " "):
+                write("\x1b[2J\x1b[H")
+                return sel
+            elif k in ("q", "\x1b", "\x03", "n", "N"):
+                write("\x1b[2J\x1b[H")
+                return len(options) - 1
+            elif k in ("y", "Y") and len(options) == 2:
+                write("\x1b[2J\x1b[H")
+                return 0
+
+    def page(self, title: str, lines: List[str]) -> None:
         cols = size().columns
+        write("\x1b[2J\x1b[H\n")
+        print("  " + fg(self.primary) + B + title + R + "\n")
         for l in lines:
-            print(clip("  " + l, cols - 1))
+            print(clip("  " + l, cols - 2))
         print()
         try:
-            input("  " + D + "enter → назад" + R)
+            input("  " + fg(MUTED) + "enter → назад" + R)
         except (EOFError, KeyboardInterrupt):
             pass
-
-    def spinner(self, i: int, label: str = "thinking") -> str:
-        return SPINNER[i % len(SPINNER)] + " " + label
+        write("\x1b[2J\x1b[H")
 
 
 def copy_to_clipboard(text: str) -> Tuple[bool, str]:
     """Best-effort clipboard copy across Termux, macOS, Linux, Windows."""
-    candidates = [
-        (["termux-clipboard-set"], None),
-        (["pbcopy"], None),
-        (["wl-copy"], None),
-        (["xclip", "-selection", "clipboard"], None),
-        (["xsel", "--clipboard", "--input"], None),
-        (["clip"], None),
-        (["powershell", "-NoProfile", "-Command", "Set-Clipboard"], None),
-    ]
-    for cmd, _ in candidates:
+    for cmd in (["termux-clipboard-set"], ["pbcopy"], ["wl-copy"],
+                ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
+                ["clip"], ["powershell", "-NoProfile", "-Command", "Set-Clipboard"]):
         try:
             subprocess.run(cmd, input=text, text=True, timeout=5,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
