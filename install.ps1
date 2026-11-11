@@ -42,16 +42,37 @@ if (-not $goCmd) {
     }
 }
 if (-not $goCmd) {
-    Say '==> Go ne nayden. Skachivayu oficialnyy ustanovshchik...'
+    Say '==> Go ne nayden. Skachivayu ustanovshchik (63 MB)...'
     $msi = Join-Path $env:TEMP 'go_installer.msi'
+    $ok = $false
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $GoMsi64 -OutFile $msi -UseBasicParsing
-    } catch {
-        Fail "Ne udalos skachat Go. Ustanovi vruchnuyu: https://go.dev/dl/ i zapusti snova."
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add('User-Agent', 'novaproxy-installer')
+        $wc.DownloadFileAsync((New-Object System.Uri($GoMsi64)), $msi)
+        $total = 63184896.0
+        while ($wc.IsBusy) {
+            if (Test-Path $msi) {
+                $cur = (Get-Item $msi).Length
+                $pct = [math]::Min(99, [int]($cur / $total * 100))
+                $mb = [math]::Round($cur / 1MB)
+                Write-Host ("`r  Skachano: {0} MB / 63 MB  ({1}%)   " -f $mb, $pct) -NoNewline
+            }
+            Start-Sleep -Milliseconds 400
+        }
+        Write-Host ''
+        $ok = (Test-Path $msi) -and ((Get-Item $msi).Length -gt 60000000)
+    } catch { $ok = $false }
+    if (-not $ok) {
+        try {
+            Invoke-WebRequest -Uri $GoMsi64 -OutFile $msi -UseBasicParsing
+            $ok = (Test-Path $msi) -and ((Get-Item $msi).Length -gt 60000000)
+        } catch { $ok = $false }
     }
-    Say '==> Ustanavlivayu Go (mozhet poprosit podtverzhdenie UAC)...'
-    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /passive /norestart" -Wait -PassThru
+    if (-not $ok) { Fail "Ne udalos skachat Go. Ustanovi vruchnuyu: https://go.dev/dl/ i zapusti snova." }
+
+    Say '==> Ustanavlivayu Go tikhim rezhimom (1-2 min, nichego ne nazhimay)...'
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
     Remove-Item $msi -Force -ErrorAction SilentlyContinue
     if ($p.ExitCode -ne 0) { Fail "Ustanovka Go zavershilas s kodom $($p.ExitCode). Ustanovi vruchnuyu: https://go.dev/dl/" }
 
