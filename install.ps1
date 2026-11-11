@@ -1,65 +1,114 @@
 # NovaProxy CLI - one-line installer for Windows (PowerShell)
 # Run: irm https://raw.githubusercontent.com/lisnoiv/novaproxy-cli/main/install.ps1 | iex
-$ErrorActionPreference = 'Stop'
+# Safe to run in elevated (Admin) PowerShell. No winget needed.
 
-$Repo = 'https://github.com/lisnoiv/novaproxy-cli.git'
-$Dir  = Join-Path $env:USERPROFILE 'novaproxy-cli'
-$Bin  = Join-Path $env:USERPROFILE 'bin'
-$Exe  = 'novaproxy.exe'
+$Repo    = 'https://github.com/lisnoiv/novaproxy-cli'
+$ZipUrl  = "$Repo/archive/refs/heads/main.zip"
+$Dir     = Join-Path $env:USERPROFILE 'novaproxy-cli'
+$Bin     = Join-Path $env:USERPROFILE 'bin'
+$Exe     = 'novaproxy.exe'
+$GoVer   = '1.22.5'
+$GoMsi64 = "https://dl.google.com/go/go$GoVer.windows-amd64.msi"
 
-Write-Host '==> NovaProxy CLI installer'
+function Say($msg) { Write-Host $msg }
+function Fail($msg) {
+    Write-Host ''
+    Write-Host "ERROR: $msg" -ForegroundColor Red
+    Write-Host ''
+    Read-Host 'Nazhmi Enter dlya vyhoda'
+    exit 1
+}
 
-# git
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Host '==> git not found, installing via winget...'
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget install --id Git.Git -e --source winget --accept-source-agreements --accept-package-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
-    } else {
-        Write-Host 'ERROR: install git manually: https://git-scm.com/download/win'
-        exit 1
+# keep window open on any unexpected error
+trap {
+    Write-Host ''
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ''
+    Read-Host 'Nazhmi Enter dlya vyhoda'
+    exit 1
+}
+
+Say '==> NovaProxy CLI installer'
+Say ''
+
+# --- Go toolchain ---------------------------------------------------------
+$goCmd = Get-Command go -ErrorAction SilentlyContinue
+if (-not $goCmd) {
+    # maybe installed but not in this session PATH yet
+    $defaultGo = 'C:\Program Files\Go\bin\go.exe'
+    if (Test-Path $defaultGo) {
+        $env:Path = "C:\Program Files\Go\bin;$env:Path"
+        $goCmd = $true
     }
 }
+if (-not $goCmd) {
+    Say '==> Go ne nayden. Skachivayu oficialnyy ustanovshchik...'
+    $msi = Join-Path $env:TEMP 'go_installer.msi'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $GoMsi64 -OutFile $msi -UseBasicParsing
+    } catch {
+        Fail "Ne udalos skachat Go. Ustanovi vruchnuyu: https://go.dev/dl/ i zapusti snova."
+    }
+    Say '==> Ustanavlivayu Go (mozhet poprosit podtverzhdenie UAC)...'
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /passive /norestart" -Wait -PassThru
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+    if ($p.ExitCode -ne 0) { Fail "Ustanovka Go zavershilas s kodom $($p.ExitCode). Ustanovi vruchnuyu: https://go.dev/dl/" }
 
-# Go
-if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    Write-Host '==> Go toolchain not found, installing via winget...'
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget install --id GoLang.Go -e --source winget --accept-source-agreements --accept-package-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
-    } else {
-        Write-Host 'ERROR: install Go manually: https://go.dev/dl/'
-        exit 1
+    # refresh PATH from registry (machine + user)
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                [System.Environment]::GetEnvironmentVariable('Path','User')
+    if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+        $defaultGo = 'C:\Program Files\Go\bin\go.exe'
+        if (Test-Path $defaultGo) { $env:Path = "C:\Program Files\Go\bin;$env:Path" }
+        else { Fail 'Go ustanovlen, no ne vizden v PATH. Perezapusti PowerShell i povtori.' }
     }
 }
+Say ("==> Go: " + (go version))
 
-if (Test-Path (Join-Path $Dir '.git')) {
-    Write-Host "==> Updating $Dir"
-    git -C $Dir pull --ff-only
-} else {
-    Write-Host "==> Cloning $Repo"
-    git clone --depth 1 $Repo $Dir
+# --- source code (zip, no git needed) -------------------------------------
+if (Test-Path (Join-Path $Dir 'main.go')) {
+    Say "==> Papka $Dir uzhe est, obnovlyayu..."
+    Remove-Item $Dir -Recurse -Force
 }
+Say '==> Skachivayu ishodniki...'
+$zip = Join-Path $env:TEMP 'novaproxy-cli.zip'
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $ZipUrl -OutFile $zip -UseBasicParsing
+} catch {
+    Fail "Ne udalos skachat repozitoriy. Prover internet i zapusti snova."
+}
+Expand-Archive -Path $zip -DestinationPath $env:TEMP -Force
+Remove-Item $zip -Force
+$extracted = Join-Path $env:TEMP 'novaproxy-cli-main'
+if (-not (Test-Path $extracted)) { Fail 'Arhiv raspakovalsya neozhidanno.' }
+Move-Item $extracted $Dir -Force
 
+# --- build ------------------------------------------------------------------
 Set-Location $Dir
-Write-Host '==> Building (vendored deps, no downloads)...'
+Say '==> Sobirayu (vendored deps, nichego ne kachaetsya)...'
 $env:GOFLAGS = '-mod=vendor'
-go build -trimpath -ldflags '-s -w' -o $Exe .
+& go build -trimpath -ldflags '-s -w' -o $Exe .
+if ($LASTEXITCODE -ne 0) { Fail 'Sborka ne udalas.' }
 
+# --- install ----------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 Copy-Item $Exe (Join-Path $Bin $Exe) -Force
 
 # add to user PATH if missing
 $userPath = [System.Environment]::GetEnvironmentVariable('Path','User')
 if ($userPath -notlike "*$Bin*") {
-    [System.Environment]::SetEnvironmentVariable('Path', "$userPath;$Bin", 'User')
-    Write-Host "==> Added $Bin to user PATH (restart terminal)"
+    [System.Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $Bin), 'User')
+    Say "==> Dobavil $Bin v PATH"
 }
 $env:Path = "$env:Path;$Bin"
 
-Write-Host ''
-Write-Host "==> Installed: $Bin\$Exe"
+Say ''
+Say "==> Ustanovleno: $Bin\$Exe"
 & (Join-Path $Bin $Exe) --version
-Write-Host ''
-Write-Host 'Zapusti:  novaproxy'
-Write-Host 'Pri pervom zapuske vvedi klyuch vida px_live_...'
+Say ''
+Say 'Zapusti:  novaproxy'
+Say 'Pri pervom zapuske vvedi klyuch vida px_live_...'
+Say ''
+Read-Host 'Nazhmi Enter dlya vyhoda'
